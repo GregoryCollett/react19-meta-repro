@@ -1,0 +1,17 @@
+{
+    "name": "react19-meta-repro",
+    "version": "0.0.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "build:client": "esbuild client.js --bundle --format=esm --outfile=public/client.js",
+        "start": "npm run build:client && node server.js"
+    },
+    "dependencies": {
+        "react": "19.2.6",
+        "react-dom": "19.2.6"
+    },
+    "devDependencies": {
+        "esbuild": "0.25.10"
+    }
+}

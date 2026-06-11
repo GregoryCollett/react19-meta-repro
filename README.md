@@ -1,6 +1,6 @@
 # React 19 metadata hoist bug repro
 
-Minimal repro for React 19 metadata hoisting failures around streaming SSR + hydration.
+Minimal repro for a React 19 hoisting bug: `<meta>` and `<link>` rendered inside a `<Suspense>` boundary that suspends past the shell flush are streamed into `<body>` instead of `<head>`, and client hydration does not recover them.
 
 ## Versions
 
@@ -13,21 +13,29 @@ No router, no bundler at runtime, no other libraries. Esbuild only bundles the c
 
 ## TL;DR
 
-React 19 documents universal hoisting of `<title>`, `<meta>`, and `<link>` from anywhere in the JSX tree to `<head>`. This repro shows that in practice three distinct hoist failures occur:
+React 19 documents universal hoisting of `<meta>` and `<link>` from anywhere in the JSX tree to `<head>`. The `?mode=ssr-fail` case in this repro shows that hoisting silently fails when the rendering component lives inside a Suspense boundary that resolves after the shell has flushed during streaming SSR.
 
 | Mode | SSR HTML | Post-hydration DOM | Bug |
 |---|---|---|---|
-| `ok` | 18 deferred tags in `<head>` ✓ | 18 in `<head>`, body clean ✓, **`<title>` duplicated** ✗ | Client-side hoisting creates a duplicate `<title>` even when no Suspense / no `use()` is involved |
-| `ssr-fail` | Deferred tags stream into `<body>` ✗ | 1 `<title>` re-hoists to head, the other 17 stay in `<body>` ✗ | SSR fails to hoist past shell-flush AND client doesn't recover most of them |
-| `client-fail` | 18 deferred tags in `<head>` ✓ | 18 in `<head>`, body clean ✓, **`<title>` duplicated** ✗ | Same client-side duplicate-title as `ok`, triggered via client `use()` re-suspension during hydration |
+| `ok` | All deferred tags in `<head>` ✓ | All in `<head>`, body clean ✓ | None (extra `<title>` is [documented React behavior](https://react.dev/reference/react-dom/components/title)) |
+| `ssr-fail` | 18 deferred tags stream into `<body>` ✗ | 17 `<meta>`/`<link>` stranded in `<body>` ✗ | **Yes** — `<meta>` and `<link>` are not hoisted at SSR and not recovered at hydration |
+| `client-fail` | All deferred tags in `<head>` ✓ | All in `<head>`, body clean ✓ | None (extra `<title>` is documented React behavior) |
+
+## A note on `<title>`
+
+This repro also surfaces a duplicate `<title>` in `<head>` after hydration in the `ok` and `client-fail` modes. This is **not** a React bug — it's [explicitly documented](https://react.dev/reference/react-dom/components/title):
+
+> Only render a single `<title>` at a time. If more than one component renders a `<title>` tag at the same time, React will place all of those titles in the document head. When this happens, the behavior of browsers and search engines is undefined.
+
+So the only `<title>` observation that matters is "1 title gets hoisted in `ssr-fail`, 17 non-title tags do not". The duplicate-`<title>` post-hydration observations in the other modes are out of scope.
 
 ## What each mode does
 
-All three modes render the same 18 metadata tags (matching the shape of a real-world per-page SEO head: `<title>`, `<meta name="description">`, `<meta name="robots">`, `<meta property="og:*">` × 7, `<meta name="twitter:*">` × 5, `<link rel="canonical">`, `<link rel="alternate">` × 2). The only differences are how/when those tags are rendered.
+All three modes render the same 18 metadata tags inside their respective component (matching the shape of a real-world per-page SEO head: `<title>`, `<meta name="description">`, `<meta name="robots">`, `<meta property="og:*">` × 7, `<meta name="twitter:*">` × 5, `<link rel="canonical">`, `<link rel="alternate">` × 2). The only differences are how/when those tags are rendered.
 
-- **`ok`** — tags rendered directly (no Suspense, no `use()`). Server uses `onAllReady`. The baseline.
-- **`ssr-fail`** — tags rendered inside `<Suspense>`; the component calls `use(promise)` where `promise` resolves after a 100 ms delay on both server and client. Server uses `onShellReady` to flush the shell first. This is the streaming SSR case where the boundary resolves during streaming.
-- **`client-fail`** — same as `ssr-fail` but the server's promise resolves at 0 ms (modeling a loader that pre-fetched data) and the server uses `onAllReady` (so the boundary completes before flush and SSR hoists). The client's promise still suspends for 100 ms during hydration (modeling a fresh promise created on the client even when data is already cached).
+- **`ok`** — tags rendered directly in body (no Suspense, no `use()`). Server uses `onAllReady`. Baseline showing hoisting works correctly when there's no suspending boundary.
+- **`ssr-fail`** — tags rendered inside `<Suspense>`; the component calls `use(promise)` where `promise` resolves after a 100 ms delay on both server and client. Server uses `onShellReady` to flush the shell first. This is the streaming SSR case where the boundary resolves *after* the shell has flushed. **This is the buggy case.**
+- **`client-fail`** — same as `ssr-fail` but the server's promise resolves at 0 ms (modeling a loader that pre-fetched data) and the server uses `onAllReady` (so the boundary completes before flush and SSR hoists). The client's promise still suspends for 100 ms during hydration (modeling a fresh promise on the client). Hoisting works correctly here.
 
 ## Run
 
@@ -40,78 +48,87 @@ Then:
 
 ```bash
 # SSR HTML — the response curl receives
-curl -s http://localhost:3030/?mode=ok        # expected: 18 deferred tags in head
-curl -s http://localhost:3030/?mode=ssr-fail  # bug: 18 deferred tags in body
+curl -s http://localhost:3030/?mode=ok          # expected: 18 deferred tags in head
+curl -s http://localhost:3030/?mode=ssr-fail    # bug:      18 deferred tags in body
 curl -s http://localhost:3030/?mode=client-fail # expected: 18 deferred tags in head
 ```
 
 Open `http://localhost:3030/?mode=<mode>` in a browser, wait ~1.5 s for hydration, then in devtools:
 
 ```js
-[...document.head.querySelectorAll('title, meta, link')].length
-[...document.body.querySelectorAll('title, meta, link')].length
-[...document.head.querySelectorAll('title')].length  // count of <title> in head
+[...document.head.querySelectorAll('meta, link')].length
+[...document.body.querySelectorAll('meta, link')].length
 ```
 
 ## Observed output
 
-### `mode=ok` — baseline (no Suspense)
+### `mode=ssr-fail` — the bug
 
 SSR HTML:
-```
-HEAD: 20 tags (charset + Static title + 18 deferred — all hoisted)
-BODY: 0 tags
+
+```html
+<head>
+    <meta charSet="utf-8"/>
+    <title>Static title</title>
+</head>
+<body>
+    <main>...</main>
+    <!-- 18 deferred metadata tags stream in here — NOT hoisted -->
+    <title>Deferred title</title>
+    <meta name="description" content="..."/>
+    <meta name="robots" content="..."/>
+    <meta property="og:image" content="..."/>
+    ... (17 non-title <meta>/<link> total)
+    <link rel="canonical" href="..."/>
+    <link rel="alternate" href="..."/>
+    <div hidden id="S:0">...</div>
+    <script>$RC("B:0","S:0")</script>
+</body>
 ```
 
-After hydration:
+Post-hydration DOM:
+
 ```
-HEAD: 21 tags — 18 deferred + Static + charset + EXTRA "Deferred title"
-BODY: 0 tags
-3 <title> elements in head: ["Deferred…", "Static", "Deferred…"]
+HEAD: 3 tags (charset + Static title + 1 Deferred title)
+BODY: 18 tags (17 non-title <meta>/<link> stranded + 1 <title>)
+[...document.body.querySelectorAll('meta, link')].length  // -> 17
 ```
 
-Bug: even with no Suspense and no `use()`, React 19 hydration inserts a duplicate `<title>` element in `<head>` for the body-rendered title.
+Bug: React 19 fails to hoist `<meta>` and `<link>` rendered inside the streaming-suspended boundary. They land in `<body>` in the SSR HTML and remain stranded there after hydration — the client does not move them to `<head>`.
 
-### `mode=ssr-fail` — streaming SSR with suspended boundary
+### `mode=ok` and `mode=client-fail` — no bug (control cases)
 
 SSR HTML:
-```
-HEAD: 2 tags (charset + Static title)
-BODY: 18 tags (all deferred tags streamed into body, NOT hoisted)
-```
 
-After hydration:
 ```
-HEAD: 3 tags (charset + Static + Deferred title)
-BODY: 18 tags (the 17 non-title deferred tags + 1 title — title duplicated across head and body)
-```
-
-Bug 1 (SSR): React 19 fails to hoist `<title>/<meta>/<link>` to `<head>` when the Suspense boundary resolves after the shell flushes. Tags stream into `<body>` instead. This breaks SEO for crawlers that don't run JavaScript.
-
-Bug 2 (hydration recovery): the client doesn't move the 17 non-title deferred tags from `<body>` to `<head>` — they remain stranded in `<body>`. Only `<title>` gets a copy in `<head>`, and it duplicates the one still in body.
-
-### `mode=client-fail` — SSR hoists, client re-suspends during hydration
-
-SSR HTML:
-```
-HEAD: 20 tags (charset + Static + 18 deferred — SSR hoisted correctly)
+HEAD: all 18 deferred tags hoisted correctly
 BODY: 0 tags
 ```
 
-After hydration:
+Post-hydration DOM:
+
 ```
-HEAD: 21 tags — duplicate "Deferred title"
+HEAD: all 18 deferred tags
 BODY: 0 tags
-3 <title> elements in head: ["Deferred…", "Static", "Deferred…"]
+(Extra <title> in head is documented React behavior; out of scope.)
 ```
 
-Bug: client-side hydration inserts a duplicate `<title>` in `<head>` even though the SSR-hoisted tag is already there. The duplicate appears whenever the deferred component's `use(promise)` suspends during hydration — even briefly.
+## Variations that confirm scope
+
+The bug requires *all* of:
+- Tags rendered inside a `<Suspense>` boundary
+- That boundary actually suspends during streaming SSR (resolves after the shell flushes)
+
+If the boundary completes before flush (use `onAllReady` or remove the delay), hoisting works. If there is no Suspense / `use()`, hoisting works. Only the streaming-suspended case fails.
 
 ## Real-world impact
 
-This is the failure mode for every per-page SEO metadata path in apps using streaming SSR with deferred data (e.g. TanStack Start + Relay, custom Vite SSR setups). The recommended React 19 pattern — render rich metadata inside a Suspense boundary so the shell can stream without waiting on the data — silently breaks SEO and creates duplicate `<title>` elements after hydration.
+This is the failure mode for every per-page SEO `<meta>` and `<link>` path in apps using streaming SSR with deferred data (TanStack Start + Relay, custom Vite SSR setups, etc.). The recommended React 19 pattern — render rich metadata inside a Suspense boundary so the shell can stream without waiting on the data — silently breaks SEO: per-page `<meta name="description">`, `og:*`, `twitter:*`, `canonical`, `alternate` etc. end up in `<body>` and never reach `<head>`, even after hydration.
 
-Related issue: [TanStack/router#3050](https://github.com/TanStack/router/issues/3050) "TanStack Start and React 19 Metadata Tags". The behavior described there is consistent with the bugs in this repro.
+## Related
+
+- [TanStack/router#3050](https://github.com/TanStack/router/issues/3050) — same symptom reported, originally attributed to TanStack. This repro confirms it occurs in pure React 19.
+- [facebook/react#32224](https://github.com/facebook/react/pull/32224) — merged Feb 2025, handles Suspense hydration in html/head/body context. `react@19.2.6` includes this PR, so the bug here is separate.
 
 ## File layout
 
